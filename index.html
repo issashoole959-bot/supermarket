@@ -1,19 +1,344 @@
-Supermarket - Local (PHP + MySQL)
-==================================
+<!doctype html>
+<html lang="so">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Supermarket - Online Frontend</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    :root{--accent:#0b4f8b}
+    body{background:#f4f7fb;color:#0b2336}
+    .card-ghost{background:#fff;padding:18px;border-radius:10px;box-shadow:0 8px 24px rgba(11,79,139,0.06)}
+    .brand{color:var(--accent);font-weight:700}
+    .low-stock{color:#d9534f;font-weight:700}
+    .small-muted{color:#6b7280;font-size:13px}
+    .sidebar{min-height:75vh}
+  </style>
+</head>
+<body>
+<nav class="navbar navbar-light bg-white shadow-sm">
+  <div class="container">
+    <a class="navbar-brand brand" href="#">Supermarket</a>
+    <div id="navRight"></div>
+  </div>
+</nav>
 
-Instructions:
-1. Install XAMPP (or similar) and start Apache & MySQL.
-2. Copy this project folder to your webroot, e.g., C:\xampp\htdocs\supermarket
-3. Import 'db.sql' into MySQL (phpMyAdmin or CLI). This creates database and default admin user.
-4. Edit 'config.php' if your DB user/password are different.
-5. Open browser: http://localhost/supermarket/index.php
-6. Login with default admin:
-   - username: admin
-   - password: 1234
-7. Only admin can add/edit/delete items and change the admin password (Settings > Change Admin Password).
-8. Sales can be recorded by logged-in user (admin). If you want cashier accounts, add users to the 'users' table with role 'cashier'.
+<div class="container my-4">
+  <div id="app"></div>
+</div>
 
-Security notes:
-- Passwords are hashed with bcrypt.
-- Change the default admin password after first login.
-- This version is for local/network use. For Internet exposure, configure HTTPS and secure the server properly.
+<!-- Minimal modal container -->
+<div id="overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.35);z-index:2000;align-items:center;justify-content:center"></div>
+
+<script>
+/*
+  Frontend SPA for Supermarket (works with api.php in same folder)
+  - Requires api.php endpoints:
+    action=login, logout, items_list, items_add, items_update, items_delete,
+    sales_create (POST JSON), reports_sales, change_password
+*/
+
+const API = 'api.php';
+
+// Helper: POST form data
+async function postForm(action, data) {
+  const fd = new FormData();
+  fd.append('action', action);
+  for (const k in data) fd.append(k, data[k]);
+  const res = await fetch(API, { method: 'POST', body: fd });
+  return res.json();
+}
+
+// Helper: POST JSON (for sales_create)
+async function postJSON(payload){
+  const res = await fetch(API, {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(payload)
+  });
+  return res.json();
+}
+
+// Initial render: show login if not logged in
+async function checkAuthAndRender(){
+  // try to call an auth-protected endpoint to test session
+  try {
+    const r = await fetch(API + '?action=items_list');
+    const j = await r.json();
+    if(j && j.ok){
+      renderApp(); // logged in
+    } else {
+      renderLogin();
+    }
+  } catch(e){
+    // network/server error: show login (server must be up)
+    renderLogin();
+  }
+}
+
+/* ------------------ Login view ------------------ */
+function renderLogin(){
+  const app = document.getElementById('app');
+  app.innerHTML = `
+    <div class="row justify-content-center">
+      <div class="col-md-6">
+        <div class="card-ghost">
+          <h4>Admin Login</h4>
+          <div id="loginAlert" class="alert alert-danger d-none"></div>
+          <div class="mb-2"><label>Username</label><input id="loginUser" class="form-control" value="admin"></div>
+          <div class="mb-2"><label>Password</label><input id="loginPass" type="password" class="form-control" value="1234"></div>
+          <div class="text-end"><button id="btnLogin" class="btn btn-primary">Login</button></div>
+        </div>
+      </div>
+    </div>
+  `;
+  document.getElementById('btnLogin').onclick = async ()=>{
+    const u = document.getElementById('loginUser').value;
+    const p = document.getElementById('loginPass').value;
+    const res = await postForm('login', {username:u, password:p});
+    if(res.ok) location.reload();
+    else {
+      const a = document.getElementById('loginAlert'); a.classList.remove('d-none'); a.textContent = res.msg || 'Login failed';
+    }
+  };
+}
+
+/* ------------------ Main App (after login) ------------------ */
+function renderApp(){
+  const app = document.getElementById('app');
+  app.innerHTML = `
+    <div class="row">
+      <div class="col-md-3">
+        <div class="card-ghost sidebar">
+          <h5>Menu</h5>
+          <div class="list-group">
+            <a href="#" class="list-group-item list-group-item-action" data-view="dashboard">Dashboard</a>
+            <a href="#" class="list-group-item list-group-item-action" data-view="items">Items</a>
+            <a href="#" class="list-group-item list-group-item-action" data-view="sales">Sales (POS)</a>
+            <a href="#" class="list-group-item list-group-item-action" data-view="reports">Reports</a>
+            <a href="#" class="list-group-item list-group-item-action" data-view="settings">Settings</a>
+            <a href="#" id="logoutLink" class="list-group-item list-group-item-action text-danger">Logout</a>
+          </div>
+        </div>
+      </div>
+      <div class="col-md-9" id="viewArea">
+        <!-- dynamic -->
+      </div>
+    </div>
+  `;
+  document.querySelectorAll('[data-view]').forEach(el => el.addEventListener('click', e=>{
+    e.preventDefault(); loadView(e.currentTarget.dataset.view);
+  }));
+  document.getElementById('logoutLink').onclick = async (e)=>{ e.preventDefault(); await postForm('logout',{}); location.reload(); };
+  loadView('dashboard');
+}
+
+/* ------------------ Views ------------------ */
+async function loadView(name){
+  const area = document.getElementById('viewArea');
+  if(name === 'dashboard'){
+    area.innerHTML = `<div class="card-ghost"><h4>Dashboard</h4><div id="dashContent">Loading...</div></div>`;
+    const itemsRes = await fetch(API + '?action=items_list').then(r=>r.json());
+    const salesRes = await fetch(API + '?action=reports_sales').then(r=>r.json());
+    const items = itemsRes.items || [];
+    const sales = salesRes.sales || [];
+    const low = items.filter(it => it.qty <= it.low_threshold);
+    let html = `<div class="row"><div class="col-md-6"><div><strong>Total items:</strong> ${items.length}</div><div class="mt-2"><strong>Low stock:</strong> ${low.length}</div></div>
+      <div class="col-md-6"><strong>Recent sales:</strong><ul>`;
+    for(let i=0;i<Math.min(5,sales.length);i++) html += `<li>${sales[i].sale_ref} — $${sales[i].total} — ${sales[i].created_at}</li>`;
+    html += `</ul></div></div>`;
+    area.querySelector('#dashContent').innerHTML = html;
+    return;
+  }
+
+  if(name === 'items'){
+    area.innerHTML = `<div class="card-ghost"><h4>Items <button id="addItemBtn" class="btn btn-sm btn-primary float-end">Add</button></h4><div id="itemsList">Loading...</div></div>`;
+    document.getElementById('addItemBtn').onclick = ()=> openItemModal();
+    await renderItemsList();
+    return;
+  }
+
+  if(name === 'sales'){
+    area.innerHTML = `<div class="card-ghost"><h4>Sales (POS)</h4><div id="posArea">Loading...</div></div>`;
+    await renderPOS();
+    return;
+  }
+
+  if(name === 'reports'){
+    area.innerHTML = `<div class="card-ghost"><h4>Reports</h4><div id="reportsArea">Loading...</div></div>`;
+    await renderReports();
+    return;
+  }
+
+  if(name === 'settings'){
+    area.innerHTML = `<div class="card-ghost"><h4>Settings</h4><div id="settingsArea"></div></div>`;
+    renderSettings();
+    return;
+  }
+}
+
+/* ---------- Items ---------- */
+async function renderItemsList(){
+  const res = await fetch(API + '?action=items_list').then(r=>r.json());
+  const c = document.getElementById('itemsList');
+  if(!res.ok) return c.innerHTML = 'Error loading items';
+  let html = `<table class="table"><thead><tr><th>Name</th><th>Qty</th><th>Price</th><th>Low</th><th>Actions</th></tr></thead><tbody>`;
+  res.items.forEach(it => {
+    html += `<tr><td>${escapeHtml(it.name)}</td><td>${it.qty}</td><td>$${parseFloat(it.price).toFixed(2)}</td><td>${it.low_threshold}</td>
+      <td><button class="btn btn-sm btn-outline-primary" data-edit="${it.id}">Edit</button> <button class="btn btn-sm btn-outline-danger" data-del="${it.id}">Delete</button></td></tr>`;
+  });
+  html += `</tbody></table>`;
+  c.innerHTML = html;
+  c.querySelectorAll('[data-edit]').forEach(b => b.addEventListener('click', e => editItem(e.target.dataset.edit)));
+  c.querySelectorAll('[data-del]').forEach(b => b.addEventListener('click', async e => {
+    if(!confirm('Delete item?')) return;
+    await postForm('items_delete', {id: e.target.dataset.del});
+    await renderItemsList();
+  }));
+}
+
+function openItemModal(item = null){
+  const overlay = document.getElementById('overlay');
+  overlay.style.display = 'flex';
+  overlay.innerHTML = `<div style="background:#fff;padding:18px;border-radius:8px;max-width:540px;width:100%">
+    <h5>${item ? 'Edit':'Add'} Item</h5>
+    <div class="mb-2"><label>Name</label><input id="it_name" class="form-control" value="${item? escapeHtml(item.name):''}"></div>
+    <div class="mb-2"><label>Qty</label><input id="it_qty" type="number" class="form-control" value="${item? item.qty:0}"></div>
+    <div class="mb-2"><label>Price</label><input id="it_price" type="number" step="0.01" class="form-control" value="${item? item.price:0}"></div>
+    <div class="mb-2"><label>Low threshold</label><input id="it_low" type="number" class="form-control" value="${item? item.low_threshold:5}"></div>
+    <div class="text-end"><button id="it_cancel" class="btn btn-secondary">Cancel</button> <button id="it_save" class="btn btn-primary">${item? 'Save':'Add'}</button></div>
+  </div>`;
+  overlay.querySelector('#it_cancel').onclick = ()=> { overlay.style.display='none'; overlay.innerHTML=''; };
+  overlay.querySelector('#it_save').onclick = async ()=>{
+    const name = overlay.querySelector('#it_name').value;
+    const qty = overlay.querySelector('#it_qty').value;
+    const price = overlay.querySelector('#it_price').value;
+    const low = overlay.querySelector('#it_low').value;
+    if(item){
+      await postForm('items_update', {id: item.id, name, qty, price, low});
+    } else {
+      await postForm('items_add', {name, qty, price, low});
+    }
+    overlay.style.display='none'; overlay.innerHTML=''; await renderItemsList();
+  };
+}
+
+async function editItem(id){
+  const res = await fetch(API + '?action=items_list').then(r=>r.json());
+  const it = res.items.find(x=> x.id == id);
+  if(it) openItemModal(it);
+}
+
+/* ---------- POS / Sales ---------- */
+async function renderPOS(){
+  const area = document.getElementById('posArea');
+  const itemsRes = await fetch(API + '?action=items_list').then(r=>r.json());
+  const items = itemsRes.items || [];
+  area.innerHTML = `<div class="row">
+    <div class="col-md-6">
+      <input id="posSearch" class="form-control mb-2" placeholder="Search item...">
+      <div id="posItemsList" style="max-height:380px;overflow:auto"></div>
+    </div>
+    <div class="col-md-6">
+      <h5>Cart</h5><div id="posCart">No items</div>
+      <div class="mt-3 text-end"><button id="posPay" class="btn btn-success">Confirm (Paid)</button>
+      <button id="posCredit" class="btn btn-outline-secondary">Confirm (Credit)</button></div>
+    </div>
+  </div>`;
+  const list = document.getElementById('posItemsList');
+  let html = '';
+  items.forEach(it => {
+    html += `<div class="d-flex justify-content-between align-items-center border-bottom py-2">
+      <div><strong>${escapeHtml(it.name)}</strong><div class="small-muted">$${parseFloat(it.price).toFixed(2)} • ${it.qty} in stock</div></div>
+      <div><input type="number" min="1" value="1" data-id="${it.id}" class="form-control form-control-sm pos-qty" style="width:80px;display:inline-block">
+      <button class="btn btn-sm btn-primary ms-2 pos-add" data-id="${it.id}" data-name="${escapeHtml(it.name)}" data-price="${it.price}">Add</button></div>
+    </div>`;
+  });
+  list.innerHTML = html;
+
+  const cart = [];
+  function renderCart(){
+    const el = document.getElementById('posCart');
+    if(cart.length===0) return el.innerHTML = '<div class="text-muted small">No items</div>';
+    let out = '<table class="table table-sm"><thead><tr><th>Item</th><th>Qty</th><th>Unit</th><th>Total</th><th></th></tr></thead><tbody>';
+    let total = 0;
+    cart.forEach((it,i)=>{
+      const sub = it.qty * it.price;
+      total += sub;
+      out += `<tr><td>${escapeHtml(it.name)}</td><td><input type="number" min="1" value="${it.qty}" data-i="${i}" class="form-control form-control-sm cart-qty" style="width:80px"></td><td>$${it.price.toFixed(2)}</td><td>$${sub.toFixed(2)}</td><td><button class="btn btn-sm btn-danger cart-remove" data-i="${i}">X</button></td></tr>`;
+    });
+    out += `</tbody></table><div class="text-end"><strong>Total: $${total.toFixed(2)}</strong></div>`;
+    el.innerHTML = out;
+    Array.from(el.querySelectorAll('.cart-remove')).forEach(b => b.addEventListener('click', e=>{ cart.splice(e.target.dataset.i,1); renderCart(); }));
+    Array.from(el.querySelectorAll('.cart-qty')).forEach(inp => inp.addEventListener('change', e=>{ cart[e.target.dataset.i].qty = parseInt(e.target.value); renderCart(); }));
+  }
+
+  Array.from(document.getElementsByClassName('pos-add')).forEach(btn => btn.addEventListener('click', e=>{
+    const id = btn.dataset.id, name = btn.dataset.name, price = parseFloat(btn.dataset.price);
+    const qtyInput = btn.parentElement.querySelector('.pos-qty');
+    const qty = parseInt(qtyInput.value) || 1;
+    const existing = cart.find(x=> x.id == id);
+    if(existing) existing.qty += qty; else cart.push({id, name, price, qty});
+    renderCart();
+  }));
+
+  document.getElementById('posPay').addEventListener('click', async ()=>{
+    if(cart.length===0) return alert('Cart empty');
+    const payload = { action:'sales_create', items: cart.map(x=>({item_id: x.id, name: x.name, qty: x.qty, price: x.price})), status: 'Paid' };
+    const res = await postJSON(payload);
+    if(res.ok){ alert('Sale saved: ' + res.ref); loadView('dashboard'); } else alert(res.msg || 'Error');
+  });
+
+  document.getElementById('posCredit').addEventListener('click', async ()=>{
+    if(cart.length===0) return alert('Cart empty');
+    const customer = prompt('Geli magaca customer (Credit):'); if(!customer) return alert('Name required');
+    const payload = { action:'sales_create', items: cart.map(x=>({item_id: x.id, name: x.name, qty: x.qty, price: x.price})), status: 'Credit', customer };
+    const res = await postJSON(payload);
+    if(res.ok){ alert('Credit sale saved: ' + res.ref); loadView('dashboard'); } else alert(res.msg || 'Error');
+  });
+}
+
+/* ---------- Reports ---------- */
+async function renderReports(){
+  const el = document.getElementById('reportsArea');
+  el.innerHTML = `<div class="row mb-2"><div class="col-md-3"><input type="date" id="r_from" class="form-control"></div><div class="col-md-3"><input type="date" id="r_to" class="form-control"></div><div class="col-md-6 text-end"><button id="r_filter" class="btn btn-sm btn-primary">Filter</button></div></div><div id="r_results"></div>`;
+  document.getElementById('r_filter').addEventListener('click', async ()=>{
+    const from = document.getElementById('r_from').value;
+    const to = document.getElementById('r_to').value;
+    const url = API + `?action=reports_sales${from? '&from='+from: ''}${to? '&to='+to: ''}`;
+    const res = await fetch(url).then(r=>r.json());
+    if(!res.ok) return document.getElementById('r_results').innerHTML = 'Error';
+    let html = '<table class="table"><thead><tr><th>Ref</th><th>Date</th><th>Total</th><th>Status</th><th>Customer</th></tr></thead><tbody>';
+    let total = 0;
+    res.sales.forEach(s => { html += `<tr><td>${s.sale_ref}</td><td>${s.created_at}</td><td>$${parseFloat(s.total).toFixed(2)}</td><td>${s.status}</td><td>${s.customer_name||''}</td></tr>`; total += parseFloat(s.total); });
+    html += `</tbody></table><div class="text-end"><strong>Grand Total: $${total.toFixed(2)}</strong></div>`;
+    document.getElementById('r_results').innerHTML = html;
+  });
+}
+
+/* ---------- Settings ---------- */
+function renderSettings(){
+  const a = document.getElementById('settingsArea');
+  a.innerHTML = `<div>
+    <h5>Change Admin Password</h5>
+    <div class="mb-2"><input id="oldPw" type="password" class="form-control" placeholder="Old password"></div>
+    <div class="mb-2"><input id="newPw" type="password" class="form-control" placeholder="New password"></div>
+    <div class="text-end"><button id="savePw" class="btn btn-primary">Save</button></div>
+  </div>`;
+  a.querySelector('#savePw').addEventListener('click', async ()=>{
+    const old = a.querySelector('#oldPw').value, nw = a.querySelector('#newPw').value;
+    if(!old || !nw) return alert('Both required');
+    const res = await postForm('change_password', {old, new: nw});
+    if(res.ok) alert('Password changed'); else alert(res.msg || 'Error');
+  });
+}
+
+/* ---------- Utils ---------- */
+function escapeHtml(s){ return String(s).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;'); }
+
+// start
+checkAuthAndRender();
+
+</script>
+</body>
+</html>
